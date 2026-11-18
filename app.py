@@ -1,182 +1,137 @@
+import uuid
 
-import streamlit as st
 import pandas as pd
 import requests
+import streamlit as st
 from supabase import create_client
 
-st.set_page_config(
-    page_title="Sebo Virtual",
-    page_icon="📚",
-    layout="wide"
-)
+
+st.set_page_config(page_title="Livraria Virtual", page_icon="📚", layout="wide")
 
 SUPABASE_URL = st.secrets["SUPABASE_URL"]
 SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
 
-# URLs do API Gateway — substituir pelas URLs reais quando os Lambdas estiverem criados
+# Endereços das rotas do API Gateway.
+API_CONSULTAR_LIVRO = st.secrets.get("API_CONSULTAR_LIVRO", "")
 API_REGISTRAR_INTERESSE = st.secrets.get("API_REGISTRAR_INTERESSE", "")
-API_ATUALIZAR_ESTOQUE   = st.secrets.get("API_ATUALIZAR_ESTOQUE", "")
-API_CADASTRAR_LIVRO     = st.secrets.get("API_CADASTRAR_LIVRO", "")
+API_CADASTRAR_LIVRO = st.secrets.get("API_CADASTRAR_LIVRO", "")
+ADMIN_PASSWORD = st.secrets.get("ADMIN_PASSWORD", "")
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 
-# ── Leituras: direto no Supabase ──────────────────────────────────────────────
-
 def buscar_livros():
-    resposta = supabase.table("livros").select("*").order("titulo").execute()
-    return resposta.data
+    return supabase.table("livros").select("*").order("titulo").execute().data
 
 
 def buscar_interesses():
-    resposta = supabase.table("interesses").select("*").execute()
-    return resposta.data
+    return supabase.table("interesses").select("*").execute().data
 
 
 def buscar_interesses_email(email):
-    resposta = (
+    return (
         supabase.table("interesses")
-        .select("*")
+        .select("id_livro,status")
         .eq("email", email)
         .execute()
+        .data
     )
-    return resposta.data
 
 
-# ── Escritas: via API Gateway (Lambda + SES) ──────────────────────────────────
-
-def chamar_registrar_interesse(id_livro, email):
-    """Lambda 1 — salva interesse no banco e envia e-mail se livro disponível."""
-    if not API_REGISTRAR_INTERESSE:
-        # Fallback direto enquanto o Lambda não está configurado
-        existente = (
-            supabase.table("interesses")
-            .select("id_interesse")
-            .eq("email", email)
-            .eq("id_livro", id_livro)
-            .execute()
-        )
-        if existente.data:
-            return {"ok": False, "mensagem": "Você já demonstrou interesse neste livro."}
-
-        livro = (
-            supabase.table("livros")
-            .select("quantidade")
-            .eq("id_livro", id_livro)
-            .execute()
-        )
-        quantidade = livro.data[0]["quantidade"] if livro.data else 0
-        status = "Disponível" if quantidade > 0 else "Aguardando"
-
-        supabase.table("interesses").insert({
-            "id_livro": id_livro,
-            "email": email,
-            "status": status
-        }).execute()
-        return {"ok": True, "mensagem": "Interesse registrado! (e-mail será enviado pelo Lambda)"}
+def chamar_lambda(url, dados):
+    if not url:
+        return {"ok": False, "mensagem": "A rota do API Gateway ainda não foi configurada."}
 
     try:
-        r = requests.post(
-            API_REGISTRAR_INTERESSE,
-            json={"id_livro": id_livro, "email": email},
-            timeout=10
-        )
-        r.raise_for_status()
-        return r.json()
-    except requests.exceptions.RequestException as e:
-        return {"ok": False, "mensagem": f"Erro ao chamar o Lambda: {e}"}
+        resposta = requests.post(url, json=dados, timeout=15)
+        conteudo = resposta.json()
+
+        # Algumas integrações devolvem o body da Lambda como uma string JSON.
+        codigo_lambda = conteudo.get("statusCode", resposta.status_code) if isinstance(conteudo, dict) else resposta.status_code
+        if isinstance(conteudo, dict) and "body" in conteudo:
+            corpo = conteudo["body"]
+            if isinstance(corpo, str):
+                import json
+                corpo = json.loads(corpo)
+            conteudo = corpo
+
+        if not isinstance(conteudo, dict):
+            return {"ok": False, "mensagem": "A API devolveu uma resposta inesperada."}
+
+        mensagem = conteudo.get("mensagem", "Operação concluída.")
+        return {"ok": resposta.ok and 200 <= int(codigo_lambda) < 300,
+                "mensagem": mensagem, "dados": conteudo}
+
+    except (requests.RequestException, ValueError) as erro:
+        return {"ok": False, "mensagem": f"Não foi possível acessar a API: {erro}"}
 
 
-def chamar_atualizar_estoque(id_livro, quantidade):
-    """Lambda 2 — atualiza estoque e notifica clientes em espera por e-mail."""
-    if not API_ATUALIZAR_ESTOQUE:
-        # Fallback direto enquanto o Lambda não está configurado
-        supabase.table("livros").update({
-            "quantidade": quantidade
-        }).eq("id_livro", id_livro).execute()
-
-        novo_status = "Disponível" if quantidade > 0 else "Aguardando"
-        supabase.table("interesses").update({
-            "status": novo_status
-        }).eq("id_livro", id_livro).execute()
-
-        return {"ok": True, "mensagem": "Estoque atualizado! (e-mails serão enviados pelo Lambda)"}
-
-    try:
-        r = requests.post(
-            API_ATUALIZAR_ESTOQUE,
-            json={"id_livro": id_livro, "quantidade": quantidade},
-            timeout=10
-        )
-        r.raise_for_status()
-        return r.json()
-    except requests.exceptions.RequestException as e:
-        return {"ok": False, "mensagem": f"Erro ao chamar o Lambda: {e}"}
+def consultar_livro(id_livro, email):
+    # Lambda ConsultarLivro
+    return chamar_lambda(API_CONSULTAR_LIVRO, {"id_livro": id_livro, "email": email})
 
 
-def chamar_cadastrar_livro(titulo, autor, quantidade):
-    """Lambda 3 — cadastra novo livro no banco."""
-    if not API_CADASTRAR_LIVRO:
-        # Fallback direto enquanto o Lambda não está configurado
-        supabase.table("livros").insert({
+def registrar_interesse(id_livro, email):
+    # Lambda RegistrarInteresse
+    return chamar_lambda(API_REGISTRAR_INTERESSE, {"id_livro": id_livro, "email": email})
+
+
+def receber_exemplares(id_livro, quantidade):
+    # Lambda CadastrarLivro
+    return chamar_lambda(
+        API_CADASTRAR_LIVRO,
+        {"id_livro": id_livro, "quantidade_adicionada": quantidade},
+    )
+
+
+def cadastrar_novo_livro(titulo, autor, quantidade):
+    # Cadastro inicial direto pelo servidor Streamlit, protegido pela senha administrativa.
+    # A Lambda CadastrarLivro atual só adiciona exemplares de títulos existentes.
+    supabase.table("livros").insert(
+        {
+            "id_livro": str(uuid.uuid4()),
             "titulo": titulo,
             "autor": autor,
-            "quantidade": quantidade
-        }).execute()
-        return {"ok": True, "mensagem": "Livro cadastrado!"}
-
-    try:
-        r = requests.post(
-            API_CADASTRAR_LIVRO,
-            json={"titulo": titulo, "autor": autor, "quantidade": quantidade},
-            timeout=10
-        )
-        r.raise_for_status()
-        return r.json()
-    except requests.exceptions.RequestException as e:
-        return {"ok": False, "mensagem": f"Erro ao chamar o Lambda: {e}"}
+            "quantidade": quantidade,
+        }
+    ).execute()
+    return {"ok": True, "mensagem": "Livro cadastrado com sucesso."}
 
 
-# ── Estilos ───────────────────────────────────────────────────────────────────
-
-st.markdown("""
-<style>
-.stApp {
-    background-color: #FAF8F3;
-}
-h1, h2, h3 {
-    color: #49372B;
-}
-div.stButton > button {
-    background-color: #75543D;
-    color: white;
-    border-radius: 8px;
-}
-</style>
-""", unsafe_allow_html=True)
+def mostrar_resultado(resultado):
+    if resultado["ok"]:
+        st.success(resultado["mensagem"])
+    else:
+        st.error(resultado["mensagem"])
 
 
-# ── Navegação ─────────────────────────────────────────────────────────────────
-
-st.sidebar.title("📚 Sebo Virtual")
-st.sidebar.caption("Sua próxima leitura está aqui!")
-
-pagina = st.sidebar.radio(
-    "Navegação",
-    ["Consultar livros", "Meus interesses", "Área do funcionário"]
+st.markdown(
+    """
+    <style>
+    .stApp { background-color: #FAF8F3; }
+    h1, h2, h3 { color: #49372B; }
+    div.stButton > button { background-color: #75543D; color: white; border-radius: 8px; }
+    </style>
+    """,
+    unsafe_allow_html=True,
 )
 
-
-# ── Páginas ───────────────────────────────────────────────────────────────────
+st.sidebar.title("Livraria Virtual")
+st.sidebar.caption("Encontre sua próxima leitura")
+pagina = st.sidebar.radio(
+    "Navegação", ["Consultar livros", "Meus interesses", "Área do funcionário"]
+)
 
 if pagina == "Consultar livros":
+    st.title("Consultar livros")
+    st.write("Pesquise o catálogo e informe seu interesse em um livro.")
+    busca = st.text_input("Pesquisar por título ou autor")
 
-    st.title("Encontre seu próximo livro")
-    st.write("Pesquise nosso catálogo e demonstre interesse.")
-
-    busca = st.text_input("Pesquisar livro ou autor")
-
-    livros = buscar_livros()
+    try:
+        livros = buscar_livros()
+    except Exception:
+        st.error("Não foi possível carregar os livros do Supabase.")
+        st.stop()
 
     filtrados = [
         livro for livro in livros
@@ -189,182 +144,142 @@ if pagina == "Consultar livros":
 
     for livro in filtrados:
         with st.container(border=True):
-            col1, col2 = st.columns([3, 1])
-
+            col1, col2 = st.columns([3, 2])
             with col1:
                 st.subheader(livro["titulo"])
                 st.write(f"Autor: {livro['autor']}")
-
                 if livro["quantidade"] > 0:
                     st.success(f"Disponível: {livro['quantidade']} unidade(s)")
                 else:
                     st.warning("Esgotado no momento")
 
             with col2:
-                email = st.text_input(
-                    "Seu e-mail",
-                    key=f"email_{livro['id_livro']}"
-                )
-
-                if st.button("Tenho interesse", key=f"interesse_{livro['id_livro']}"):
+                email = st.text_input("Seu e-mail", key=f"email_{livro['id_livro']}")
+                if st.button("Tenho interesse", key=f"botao_{livro['id_livro']}"):
                     email = email.strip().lower()
-
-                    if "@" not in email or "." not in email:
+                    if "@" not in email or "." not in email.split("@")[-1]:
                         st.error("Informe um e-mail válido.")
+                    elif livro["quantidade"] > 0:
+                        resultado = consultar_livro(livro["id_livro"], email)
+                        mostrar_resultado(resultado)
+                        if resultado["ok"]:
+                            st.info("O envio do aviso por e-mail ainda depende da integração com o SNS.")
                     else:
-                        resultado = chamar_registrar_interesse(livro["id_livro"], email)
-                        if resultado.get("ok"):
-                            st.success(resultado["mensagem"])
-                            st.rerun()
-                        else:
-                            st.info(resultado["mensagem"])
-
+                        mostrar_resultado(registrar_interesse(livro["id_livro"], email))
 
 elif pagina == "Meus interesses":
-
     st.title("Meus interesses")
-    st.write("Acompanhe os livros que você está esperando.")
-
+    st.write("Confira as solicitações registradas para seu e-mail.")
+    st.caption("Consulta demonstrativa: para publicar a aplicação, será necessário verificar a identidade do cliente.")
     email = st.text_input("Informe seu e-mail")
 
     if st.button("Consultar interesses"):
-
         email = email.strip().lower()
-        interesses = buscar_interesses_email(email)
-        livros = buscar_livros()
-
-        livros_dict = {
-            livro["id_livro"]: livro["titulo"]
-            for livro in livros
-        }
-
-        if interesses:
-            for interesse in interesses:
-                with st.container(border=True):
-
-                    titulo = livros_dict.get(
-                        interesse["id_livro"],
-                        "Livro não encontrado"
-                    )
-
-                    st.subheader(titulo)
-
-                    if interesse["status"] == "Disponível":
-                        st.success("Livro disponível")
-                    else:
-                        st.warning("Aguardando reposição")
+        if "@" not in email or "." not in email.split("@")[-1]:
+            st.error("Informe um e-mail válido.")
         else:
-            st.info("Nenhum interesse encontrado para este e-mail.")
-
+            try:
+                interesses = buscar_interesses_email(email)
+                nomes = {livro["id_livro"]: livro["titulo"] for livro in buscar_livros()}
+                if not interesses:
+                    st.info("Nenhum interesse encontrado para este e-mail.")
+                for interesse in interesses:
+                    with st.container(border=True):
+                        st.subheader(nomes.get(interesse["id_livro"], "Livro não encontrado"))
+                        if interesse["status"] == "avisado":
+                            st.success("Aviso solicitado")
+                        else:
+                            st.warning("Aguardando reposição")
+            except Exception:
+                st.error("Não foi possível consultar os interesses.")
 
 elif pagina == "Área do funcionário":
+    st.title("Área do funcionário")
+    if not ADMIN_PASSWORD:
+        st.warning("Configure ADMIN_PASSWORD nos secrets do Streamlit para liberar esta área.")
+        st.stop()
 
-    st.title("Painel administrativo")
+    if not st.session_state.get("funcionario_autenticado", False):
+        with st.form("acesso_funcionario"):
+            senha = st.text_input("Senha do funcionário", type="password")
+            entrar = st.form_submit_button("Entrar")
+            if entrar:
+                if senha == ADMIN_PASSWORD:
+                    st.session_state["funcionario_autenticado"] = True
+                    st.rerun()
+                else:
+                    st.error("Senha incorreta.")
+        st.stop()
 
-    livros = buscar_livros()
-    interesses = buscar_interesses()
+    if st.button("Sair da área do funcionário"):
+        st.session_state["funcionario_autenticado"] = False
+        st.rerun()
+
+    try:
+        livros = buscar_livros()
+        interesses = buscar_interesses()
+    except Exception:
+        st.error("Não foi possível carregar os dados administrativos.")
+        st.stop()
 
     col1, col2, col3 = st.columns(3)
-
     col1.metric("Livros cadastrados", len(livros))
-    col2.metric(
-        "Unidades em estoque",
-        sum(livro["quantidade"] for livro in livros)
-    )
-    col3.metric("Clientes interessados", len(interesses))
-
+    col2.metric("Unidades em estoque", sum(livro["quantidade"] for livro in livros))
+    col3.metric("Interesses registrados", len(interesses))
     st.divider()
 
     aba1, aba2, aba3 = st.tabs(["Estoque", "Cadastrar livro", "Interessados"])
 
     with aba1:
-
         st.subheader("Controle de estoque")
-
         if livros:
-
-            df = pd.DataFrame(livros)
             st.dataframe(
-                df[["titulo", "autor", "quantidade"]],
+                pd.DataFrame(livros)[["titulo", "autor", "quantidade"]],
                 use_container_width=True,
-                hide_index=True
+                hide_index=True,
             )
-
             livro_selecionado = st.selectbox(
-                "Selecione um livro",
-                livros,
-                format_func=lambda livro: livro["titulo"]
+                "Selecione um livro", livros, format_func=lambda item: item["titulo"]
             )
-
             quantidade = st.number_input(
-                "Nova quantidade em estoque",
-                min_value=0,
-                step=1,
-                value=livro_selecionado["quantidade"]
+                "Quantidade de exemplares recebidos", min_value=1, step=1, value=1
             )
-
-            if st.button("Atualizar estoque"):
-                resultado = chamar_atualizar_estoque(
-                    livro_selecionado["id_livro"],
-                    quantidade
-                )
-                if resultado.get("ok"):
-                    st.success(resultado["mensagem"])
-                    st.rerun()
-                else:
-                    st.error(resultado["mensagem"])
-
+            if st.button("Adicionar ao estoque"):
+                mostrar_resultado(receber_exemplares(livro_selecionado["id_livro"], int(quantidade)))
         else:
             st.info("Nenhum livro cadastrado.")
 
     with aba2:
-
         st.subheader("Cadastrar novo livro")
-
         with st.form("cadastro_livro"):
-
             titulo = st.text_input("Título")
             autor = st.text_input("Autor")
-            quantidade = st.number_input("Quantidade", min_value=0, step=1)
-
+            quantidade = st.number_input("Quantidade inicial", min_value=0, step=1, value=0)
             cadastrar = st.form_submit_button("Cadastrar livro")
-
             if cadastrar:
-                if titulo and autor:
-                    resultado = chamar_cadastrar_livro(titulo, autor, quantidade)
-                    if resultado.get("ok"):
-                        st.success(resultado["mensagem"])
-                        st.rerun()
-                    else:
-                        st.error(resultado["mensagem"])
-                else:
+                if not titulo.strip() or not autor.strip():
                     st.error("Preencha o título e o autor.")
+                else:
+                    try:
+                        mostrar_resultado(
+                            cadastrar_novo_livro(titulo.strip(), autor.strip(), int(quantidade))
+                        )
+                    except Exception:
+                        st.error("Não foi possível cadastrar o livro.")
 
     with aba3:
-
         st.subheader("Clientes interessados")
-
         if interesses:
-
-            livros_dict = {
-                livro["id_livro"]: livro["titulo"]
-                for livro in livros
-            }
-
-            dados = []
-            for interesse in interesses:
-                dados.append({
-                    "Livro": livros_dict.get(
-                        interesse["id_livro"],
-                        "Livro não encontrado"
-                    ),
+            nomes = {livro["id_livro"]: livro["titulo"] for livro in livros}
+            dados = [
+                {
+                    "Livro": nomes.get(interesse["id_livro"], "Livro não encontrado"),
                     "E-mail": interesse["email"],
                     "Status": interesse["status"],
-                    "Data": interesse["criado_em"]
-                })
-
-            df = pd.DataFrame(dados)
-            st.dataframe(df, use_container_width=True, hide_index=True)
-
+                    "Data": interesse["criado_em"],
+                }
+                for interesse in interesses
+            ]
+            st.dataframe(pd.DataFrame(dados), use_container_width=True, hide_index=True)
         else:
             st.info("Ainda não existem interessados cadastrados.")
